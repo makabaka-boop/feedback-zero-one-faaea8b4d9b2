@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "warclake"
+version = "0.1.0"
+description = "WARC 1.1 归档入湖后端：分帧组装、严格校验、引用还原与原子 JSON 输出"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "warclake" }]
+dependencies = []
+
+[project.scripts]
+warclake = "warclake.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["warclake*"]
