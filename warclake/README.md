@@ -58,15 +58,17 @@ warclake/
 ├── pyproject.toml              # 包元数据与 console 入口
 ├── run_warclake.py             # 显式入口（python -I 隔离模式可用）
 ├── warclake/
-│   ├── __init__.py             # 公开 API
+│   ├── __init__.py             # 公开 API（含 BatchStore）
 │   ├── __main__.py             # CLI: python -m warclake
 │   ├── errors.py               # IngestError（文件下标 + 字节起点）
 │   ├── warc.py                 # 自写 WARC 1.1 分帧组装
 │   ├── httpmsg.py              # 自写 HTTP 响应解析
 │   ├── digests.py              # sha1 / 大写 Base32 摘要校验
-│   └── ingest.py               # 主流程与原子输出
+│   ├── ingest.py               # 一次性主流程与原子 JSON 输出
+│   └── store.py                # SQLite 分批入湖：submit/query 与全湖裁决
 ├── tests/
-│   └── test_warclake.py        # 独立字节验收（46 项）
+│   ├── test_warclake.py        # 一次性入口独立字节验收（46 项）
+│   └── test_store.py           # 分批入湖验收（27 项，含并发与强退恢复）
 └── demo/
     └── end_to_end_demo.py      # 端到端 CLI 演练
 ```
@@ -95,6 +97,59 @@ records = build_archive(["part-a.warc", "part-b.warc"])  # 失败抛 IngestError
 write_atomic("capture.json", records)                    # 成功才原子替换
 ```
 
+## SQLite 分批入湖（引用可迟到）
+
+`build_archive` 要求一次性交回全部文件；分批交回、revisit 引用的正文可能
+**迟到**时使用 `BatchStore`（纯标准库 `sqlite3`，无第三方依赖）：
+
+```python
+from warclake import BatchStore, IngestError
+
+with BatchStore("lake.sqlite") as store:
+    batch_id = store.submit(["part-1.warc", "part-2.warc"])  # 从 1 连续的批号
+    store.query(batch_id)
+    # {"state": "pending"|"ready"|"failed", "rows": ..., "error": ...}
+```
+
+### 受理与裁决两阶段
+
+| 阶段 | 触发条件 | 后果 |
+| --- | --- | --- |
+| 受理（gate） | 分帧残帧/截断、ID 非 `<...>` 格式、**全库** ID 重复、Block-Digest 不符、收录类型非法、文件不可读 | 抛 `IngestError`（坐标为批内零基文件号 + 记录零基字节起点），事务整体回滚、**不占批号** |
+| 裁决 | 其余全部原校验（分段、HTTP、Payload-Digest、revisit 前缀/摘要、引用环等） | 批号保留并落库；批次状态为 `ready` / `pending` / `failed` |
+
+* **分段必须批内完整**：continuation 与首段 R 不在同一批即各自违规，绝不
+  跨批拼接；V 的 `WARC-Refers-To` 则**可跨批**引用 R 或 V。
+* 引用的逻辑记录全湖暂不存在 → `pending`（引用允许迟到）。
+* 批依赖按 V 的**直接引用**建立。本批及全部传递依赖齐备、全部原校验通过、
+  且**记录引用无环**才 `ready`；**批级依赖成环但记录无环时允许整组发布**。
+* 批次自身违规、或任一传递依赖 `failed` → 本批 `failed`（**优先于 pending**），
+  失败沿依赖边传播；failed 批中即使合法的 R 也不可用。
+
+### `query(n)` 契约
+
+```jsonc
+// ready：rows 为原批捕获数组（按批内文件号、字节起点升序），error 为 null
+{"state": "ready",   "rows": [{"id": "...", "target": "...", "data": "QUI=", "source": "..."}], "error": null}
+// pending：rows / error 均为 null
+{"state": "pending", "rows": null, "error": null}
+// failed：error 为任一根因 [批号, 零基文件号, 记录零基字节起点]
+{"state": "failed",  "rows": null, "error": [2, 0, 277]}
+```
+
+未知批号（含受理被拒、从未分配的编号）抛 `KeyError`。空批（`submit([])`）
+立即 `ready` 且 `rows == []`，同样占用一个批号。
+
+### 持久化与并发
+
+* 每次提交的“原字节落库 + 全库级联裁决”在**单个 SQLite 事务**内提交
+  （`BEGIN IMMEDIATE` + `synchronous=FULL`），配合进程内互斥锁；多线程、
+  多进程并发提交等价于某一种串行顺序，批号不重不跳。
+* 库内只存**原始字节**与裁决状态，不存任何输入路径；重启后仅靠 SQLite
+  文件即可继续受理与查询，原始 WARC 路径可删除。
+* 提交任意时刻强退：事务原子性保证库内只可能是“提交前”或“提交后”，
+  重启后批号序列与各批状态一致、无孤儿文件行。
+
 ## 独立字节验收
 
 测试中的所有 WARC 字节均在测试文件内手工拼装，摘要用 `hashlib/base64`
@@ -103,7 +158,8 @@ Base64 字节，也逐条断言拒绝路径的（文件下标, 字节起点）�
 子进程、跨文件乱序分段、引用环、失败保留旧输出等验收：
 
 ```bash
-python3 -I tests/test_warclake.py -v          # 46 项
+python3 -I tests/test_warclake.py -v          # 一次性入口：46 项
+python3 -I tests/test_store.py -v             # 分批入湖：27 项（含 SIGKILL 强退恢复）
 python3 -I demo/end_to_end_demo.py            # 端到端演练
 ```
 
